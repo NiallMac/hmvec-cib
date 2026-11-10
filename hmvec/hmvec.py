@@ -713,10 +713,12 @@ class HaloModel(Cosmology):
             sources above the cut at a or at b (a common mask for that pair); cuts=None then uses self.flux_cuts
             (see set_fluxcuts), and both observed bands must have an entry (matched to 1%).
         sigma_ln: lognormal scatter of L at fixed (sub)halo mass, L = Lbar exp(sigma g - sigma^2/2), the same factor in
-            every band (mean preserving, so it only matters with a cut). Default 0 (hmvec's deterministic L-M relation).
+            every band. Default 0 (hmvec's deterministic L-M relation). Mean preserving, so it changes the clustered
+            terms only together with a cut; it always raises the shot noise (get_power_shot), by e^{sigma^2} uncut.
 
         The clustered (1h, 2h) terms involve distinct galaxies only, so they use the retained FIRST moment of each
-        galaxy's flux, Sbar Phi((ln x - sigma^2/2)/sigma) with x = S_cut/Sbar (-> Sbar 1(x > 1) for sigma = 0)."""
+        galaxy's flux, Sbar Phi((ln x - sigma^2/2)/sigma) with x = S_cut/Sbar (-> Sbar 1(x > 1) for sigma = 0); the
+        shot term uses the retained SECOND moment, Sbar^2 e^{sigma^2} Phi((ln x - 3 sigma^2/2)/sigma)."""
         if per_map and cuts is None:
             cuts = self.flux_cuts
         self.cib_fluxcuts = dict(cuts) if cuts else {}
@@ -915,22 +917,65 @@ class HaloModel(Cosmology):
     Power Stuff
     """
 
-    def get_power(self,name1,name2=None,nu_obs=None,verbose=False, subhalos=True, cibinteg='trap', satmf='Tinker'):
+    def get_power(self,name1,name2=None,nu_obs=None,verbose=False, subhalos=True, cibinteg='trap', satmf='Tinker',
+                  shot=False):
         '''
         CIB Keyword Arguments:
         nu_obs [2darray] : 1st axis - freq's to be cross correlated. 2nd axis - bandpass
         subhalos [bool]  : flag to add satellite galaxies
         cibinteg [str]   : integration method for subhalo masses for cib; either "trap" or "simps"
         satmf [str]      : subhalo mass function; either 'Tinker' or 'Jiang'
+        shot [bool]      : CIB x CIB only -- also add the Poisson term get_power_shot (default False, i.e. the
+                           clustered 1h + 2h power only, as before)
         '''
         if name2 is None: name2 = name1
 
         if name1.lower() == 'cib' or name2.lower() == 'cib':
             nu_obs = self._freqtest(nu_obs)
-            return self.get_power_1halo(name1,name2, nu_obs, subhalos, cibinteg, satmf) + self.get_power_2halo(name1,name2,verbose, nu_obs, subhalos, cibinteg, satmf)
+            p = self.get_power_1halo(name1,name2, nu_obs, subhalos, cibinteg, satmf) + self.get_power_2halo(name1,name2,verbose, nu_obs, subhalos, cibinteg, satmf)
+            if shot:
+                p = p + self.get_power_shot(name1, name2, nu_obs, subhalos, cibinteg, satmf)
+            return p
         else:
             return self.get_power_1halo(name1,name2) + self.get_power_2halo(name1,name2,verbose)
 
+
+    def get_power_shot(self, name="cib", name2=None, nu_obs=None, subhalos=True, cibinteg='trap', satmf='Tinker'):
+        '''Poisson (shot-noise) power of the CIB -- the galaxy self-pairs that the mean-luminosity 1h/2h terms omit:
+
+            P_shot(z) = int dM n(M,z) [ L_a L_b rho2(cen) + int dm dN/dm(m|M) L_a(m) L_b(m) rho2(sat) ] / (4 pi)^2
+
+        in the same units as get_power_1halo('cib','cib') [Jy^2 Mpc], so the same Limber projection (CIB window
+        a^2) turns it into a flat C_ell [Jy^2/sr]. rho2 is the retained second moment of a galaxy's flux after the
+        flux cut of set_cib_fluxcut (1 without a cut; e^{sigma^2} Phi((ln x - 3 sigma^2/2)/sigma) with scatter).
+        Returned on the (z, k) grid, constant in k. Only defined for 'cib' x 'cib'.
+
+        Without a flux cut the projected shot noise diverges as z_min -> 0 (the nearest sources are the brightest),
+        so a cut -- and a z grid reaching well below the redshift where the brightest galaxies cross it -- is needed
+        for a physical value. Satellites use the sub-halo grid of set_cib_subhalo_grid (~200 points converges).
+
+        nu_obs [2darray], subhalos, cibinteg, satmf: as get_power_1halo.'''
+        name2 = name if name2 is None else name2
+        if name.lower() != 'cib' or name2.lower() != 'cib':
+            raise ValueError("get_power_shot is only defined for 'cib' x 'cib'")
+        nu_obs = self._freqtest(nu_obs)
+        cuts = self._cib_pair_cuts(nu_obs)
+        t = self._cib_sigma_threshold(cuts)                                       # (nz,)
+
+        sig = self.cib_sigma_m()                                                  # (nm,)
+        per_m = sig[None, :]**2 * self._cib_retained(t[:, None] / sig[None, :], moment=2)
+        if subhalos:
+            satms = self.cib_subhalo_grid()                                       # (nm, nsub)
+            ssig = self.cib_sigma_m(satms)
+            integ = (sdndm(satms, self.ms[..., None], satmf) * ssig**2)[None] * \
+                self._cib_retained(t[:, None, None] / ssig[None], moment=2)         # (nz, nm, nsub)
+            if cibinteg.lower() == 'trap':
+                per_m = per_m + np.trapz(integ, satms[None], axis=-1)
+            elif cibinteg.lower() == 'simps':
+                per_m = per_m + simps(integ, x=satms[None], axis=-1)
+            else: raise NotImplementedError('Invalid subhalo integration method (cibinteg)')
+        pz = self.cib_lum_z(nu_obs[0]) * self.cib_lum_z(nu_obs[1]) * np.trapz(self.nzm * per_m, self.ms, axis=-1)
+        return np.repeat(pz[:, None], len(self.ks), axis=-1)
 
     def get_power_1halo(self,name="nfw",name2=None, nu_obs=None, subhalos=True, cibinteg='trap', satmf='Tinker'):
         '''
