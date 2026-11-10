@@ -101,6 +101,8 @@ class HaloModel(Cosmology):
         self.hods = {}
         self.cib_params = {}
         self.flux_cuts = {}
+        self.cib_nsub = None          # sub-halo mass grid size; None = len(ms)+1 (see set_cib_subhalo_grid)
+        self.cib_msub_min = 1e10      # smallest sub-halo mass hosting a satellite [Msun]
         self.fnl = fnl
 
         # Mass function
@@ -633,9 +635,7 @@ class HaloModel(Cosmology):
             return sdndm(m, M, satmf) * cib.capitalSigma(m, self.cib_params['logM_eff'], self.cib_params['var'])
 
         #Integrate Subhalo Masses
-        Nsatm = len(self.ms) + 1
-        Mmin = 1e10
-        satms = np.geomspace(Mmin, self.ms, num=Nsatm, axis=-1)
+        satms = self.cib_subhalo_grid()
         if cibinteg.lower() == 'trap':
             fsat_m = np.trapz(integ(satms, self.ms[...,None]), satms, axis=-1)
         elif cibinteg.lower() == 'simps':
@@ -657,6 +657,48 @@ class HaloModel(Cosmology):
         fsat = fsat_zz * fsat_mm
 
         return fsat / (4.0*np.pi)
+
+    def set_cib_subhalo_grid(self, nsub=None, msub_min=1e10):
+        """Sub-halo mass grid used for the satellite integrals (get_fsat): for each host mass M, nsub log-spaced
+        sub-halo masses from msub_min to M.
+
+        nsub=None keeps the historical choice nsub = len(ms)+1. That is coarse when the host grid is coarse: with
+        20 host masses it overestimates the satellite flux of M > 1e11 hosts by up to ~7% relative to a converged
+        (~2000-point) sub-halo integral. ~200 points is converged to <0.1%."""
+        self.cib_nsub = nsub
+        self.cib_msub_min = msub_min
+
+    def cib_subhalo_grid(self):
+        """Sub-halo masses for each host, shape (nm, nsub): log-spaced from cib_msub_min to the host mass."""
+        nsub = len(self.ms) + 1 if self.cib_nsub is None else self.cib_nsub
+        return np.geomspace(self.cib_msub_min, self.ms, num=nsub, axis=-1)
+
+    def cib_lum_z(self, nu, zs=None):
+        """Redshift/frequency part of the CIB luminosity over 4 pi, L_o Phi(z) Theta(nu(1+z), z) / (4 pi), so that
+        one galaxy in a (sub)halo of mass m has L/(4 pi) = cib_lum_z(nu, z) * cib_sigma_m(m)  [Jy Mpc^2].
+
+        nu: observed frequency [Hz], a scalar / length-1 array, or a length-2 bandpass [nu_lo, nu_hi] (as get_fcen).
+        zs: redshifts (default self.zs). Returns shape (nz,)."""
+        p = self.cib_params
+        zs = self.zs if zs is None else np.atleast_1d(np.asarray(zs, dtype=float))
+        nu = np.atleast_1d(np.asarray(nu, dtype=float))
+        return p['L_o'] * cib.capitalPhi(zs, p['delta']) * \
+            cib.capitalTheta(nu, 'obs', zs, p['alpha'], p['beta'], p['gamma'], p['Td_o']) / (4.0*np.pi)
+
+    def cib_sigma_m(self, ms=None):
+        """Mass part of the CIB luminosity, Sigma(m) [Msun] (lognormal in log10 m times m); any array shape."""
+        ms = self.ms if ms is None else np.asarray(ms, dtype=float)
+        return cib.capitalSigma(ms, self.cib_params['logM_eff'], self.cib_params['var'])
+
+    def cib_galaxy_flux(self, nu, ms=None, zs=None):
+        """Observed flux [Jy] of ONE galaxy (central or satellite -- the same L-M relation) in a (sub)halo of mass
+        ms at redshift zs: S = L / (4 pi chi^2 (1+z)). Shape (nz,) + shape(ms); defaults self.zs, self.ms.
+        Without scatter in L this is the flux of every galaxy at that (m, z); the halo model's mean fluxes are
+        get_fcen (one central) and get_fsat (summed satellites)."""
+        zs = self.zs if zs is None else np.atleast_1d(np.asarray(zs, dtype=float))
+        ms = self.ms if ms is None else np.asarray(ms, dtype=float)
+        lz = self.cib_lum_z(nu, zs) / (self.comoving_radial_distance(zs)**2 * (1.0 + zs))
+        return lz.reshape(lz.shape + (1,)*np.ndim(ms)) * self.cib_sigma_m(ms)
 
     def _cut_flux(self, L, freq):
         totflux = self.get_flux(freq)
