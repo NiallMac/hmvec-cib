@@ -103,6 +103,9 @@ class HaloModel(Cosmology):
         self.flux_cuts = {}
         self.cib_nsub = None          # sub-halo mass grid size; None = len(ms)+1 (see set_cib_subhalo_grid)
         self.cib_msub_min = 1e10      # smallest sub-halo mass hosting a satellite [Msun]
+        self.cib_fluxcuts = {}        # {nu_GHz: S_cut_Jy}; empty = no flux cut (see set_cib_fluxcut)
+        self.cib_fluxcut_per_map = False
+        self.cib_sigma_ln = 0.0       # lognormal scatter of L at fixed (sub)halo mass, used with a flux cut
         self.fnl = fnl
 
         # Mass function
@@ -700,27 +703,111 @@ class HaloModel(Cosmology):
         lz = self.cib_lum_z(nu, zs) / (self.comoving_radial_distance(zs)**2 * (1.0 + zs))
         return lz.reshape(lz.shape + (1,)*np.ndim(ms)) * self.cib_sigma_m(ms)
 
-    def _cut_flux(self, L, freq):
-        totflux = self.get_flux(freq)
+    def set_cib_fluxcut(self, cuts=None, per_map=False, sigma_ln=0.0):
+        """Remove bright CIB sources (point-source masking) from the CIB power spectra.
 
-    def _get_cib(self, freq, satflag=True, cibinteg='trap', satmf='Tinker'):
-        '''Assumes central galaxies are at the center of the halo'''
+        cuts: {nu_GHz: S_cut_Jy}, a source is removed if its flux exceeds S_cut in any listed band. None or {} with
+            per_map=False: no cut (the default; outputs are then exactly the uncut model).
+        per_map: False -> every cut in `cuts` applies to every CIB map (one common mask, e.g. sources detected at
+            145 GHz removed from all bands). True -> Planck-style: the power spectrum of bands (a, b) removes only
+            sources above the cut at a or at b (a common mask for that pair); cuts=None then uses self.flux_cuts
+            (see set_fluxcuts), and both observed bands must have an entry (matched to 1%).
+        sigma_ln: lognormal scatter of L at fixed (sub)halo mass, L = Lbar exp(sigma g - sigma^2/2), the same factor in
+            every band (mean preserving, so it only matters with a cut). Default 0 (hmvec's deterministic L-M relation).
+
+        The clustered (1h, 2h) terms involve distinct galaxies only, so they use the retained FIRST moment of each
+        galaxy's flux, Sbar Phi((ln x - sigma^2/2)/sigma) with x = S_cut/Sbar (-> Sbar 1(x > 1) for sigma = 0)."""
+        if per_map and cuts is None:
+            cuts = self.flux_cuts
+        self.cib_fluxcuts = dict(cuts) if cuts else {}
+        self.cib_fluxcut_per_map = bool(per_map)
+        self.cib_sigma_ln = float(sigma_ln)
+
+    def _cib_pair_cuts(self, nu_pair):
+        """{nu_GHz: S_cut_Jy} that applies to the CIB power spectrum of the band pair nu_pair (hmvec's nu_obs after
+        _freqtest: two entries in Hz, each a frequency or a bandpass)."""
+        if not self.cib_fluxcuts:
+            return {}
+        if not self.cib_fluxcut_per_map:
+            return dict(self.cib_fluxcuts)
+        out = {}
+        for leg in nu_pair:
+            nu_ghz = float(np.mean(leg)) / 1e9
+            match = [k for k in self.cib_fluxcuts if abs(k - nu_ghz) <= 0.01 * k]
+            if not match:
+                raise ValueError(f"per-map CIB flux cut: no cut for {nu_ghz:g} GHz in {sorted(self.cib_fluxcuts)}")
+            out[match[0]] = self.cib_fluxcuts[match[0]]
+        return out
+
+    def _cib_sigma_threshold(self, cuts, zs=None):
+        """Largest Sigma(m) [Msun] whose mean flux is below every cut, per redshift: t(z) = min_k S_k / A_k(z) with
+        A_k = cib_lum_z(nu_k) / (chi^2 (1+z)); inf without cuts."""
+        zs = self.zs if zs is None else zs
+        t = np.full(len(zs), np.inf)
+        ff = 1.0 / (self.comoving_radial_distance(zs)**2 * (1.0 + zs))
+        for nu_ghz, s_cut in cuts.items():
+            t = np.minimum(t, s_cut / (self.cib_lum_z(nu_ghz * 1e9, zs) * ff))
+        return t
+
+    def _cib_retained(self, x, moment=1):
+        """Fraction of a galaxy's mean flux (moment=1) or mean squared flux / Sbar^2 (moment=2) kept by a cut at
+        S_cut = x Sbar, with lognormal scatter self.cib_sigma_ln."""
+        s = self.cib_sigma_ln
+        x = np.asarray(x, dtype=float)
+        if s == 0:
+            return (x > 1).astype(float)
+        with np.errstate(divide='ignore'):
+            if moment == 1:
+                return scipy.special.ndtr((np.log(x) - 0.5*s**2) / s)
+            return np.exp(s**2) * scipy.special.ndtr((np.log(x) - 1.5*s**2) / s)
+
+    def get_fcen_cut(self, nu, cuts):
+        """get_fcen after removing sources above `cuts` ({nu_GHz: Jy}); identical to get_fcen when cuts is empty."""
+        if not cuts:
+            return self.get_fcen(nu)
+        t = self._cib_sigma_threshold(cuts)
+        sig = self.cib_sigma_m()
+        keep = self._cib_retained(t[:, None] / sig[None, :])
+        f = self.cib_lum_z(nu)[:, None] * sig[None, :] * keep
+        return np.repeat(f[..., None], len(self.ks), axis=-1)
+
+    def get_fsat_cut(self, nu, cuts, cibinteg='trap', satmf='Tinker'):
+        """get_fsat after removing satellites above `cuts` ({nu_GHz: Jy}); identical to get_fsat when cuts is empty.
+        The cut makes the sub-halo integral z-dependent, so it is done on the full (z, M, m_sub) grid."""
+        if not cuts:
+            return self.get_fsat(nu, cibinteg, satmf)
+        t = self._cib_sigma_threshold(cuts)
+        satms = self.cib_subhalo_grid()                                            # (nm, nsub)
+        sig = self.cib_sigma_m(satms)
+        integ = sdndm(satms, self.ms[..., None], satmf) * sig                       # (nm, nsub)
+        integ = integ[None] * self._cib_retained(t[:, None, None] / sig[None])     # (nz, nm, nsub)
+        if cibinteg.lower() == 'trap':
+            fsat_m = np.trapz(integ, satms[None], axis=-1)
+        elif cibinteg.lower() == 'simps':
+            fsat_m = simps(integ, x=satms[None], axis=-1)
+        else: raise NotImplementedError('Invalid subhalo integration method (cibinteg)')
+        f = self.cib_lum_z(nu)[:, None] * fsat_m
+        return np.repeat(f[..., None], len(self.ks), axis=-1)
+
+    def _get_cib(self, freq, satflag=True, cibinteg='trap', satmf='Tinker', cuts=None):
+        '''Assumes central galaxies are at the center of the halo. cuts: {nu_GHz: Jy} sources removed (see
+        set_cib_fluxcut); None/empty = no cut.'''
         uhalo = self.uk_profiles['nfw']
-        fcen = self.get_fcen(freq)
+        fcen = self.get_fcen_cut(freq, cuts)
         if satflag:
-            fsat = self.get_fsat(freq, cibinteg, satmf)
+            fsat = self.get_fsat_cut(freq, cuts, cibinteg, satmf)
         else:
             fsat = 0.
         return fcen + uhalo*fsat
 
-    def _get_cib_square(self, freq, satflag=True, cibinteg='trap', satmf='Tinker'):
-        '''Assumes central galaxies are at the center of the halo'''
+    def _get_cib_square(self, freq, satflag=True, cibinteg='trap', satmf='Tinker', cuts=None):
+        '''Assumes central galaxies are at the center of the halo. cuts: see _get_cib.'''
         if satflag:
             uhalo = self.uk_profiles['nfw']
-            fcen1 = self.get_fcen(freq[0])
-            fcen2 = self.get_fcen(freq[1])
-            fsat1 = self.get_fsat(freq[0], cibinteg, satmf)
-            fsat2 = self.get_fsat(freq[1], cibinteg, satmf)
+            fcen1 = self.get_fcen_cut(freq[0], cuts)
+            fcen2 = self.get_fcen_cut(freq[1], cuts)
+            fsat1 = self.get_fsat_cut(freq[0], cuts, cibinteg, satmf)
+            fsat2 = self.get_fsat_cut(freq[1], cuts, cibinteg, satmf)
 
             return (fcen1*fsat2*uhalo) + (fcen2*fsat1*uhalo) + (fsat1*fsat2*uhalo*uhalo)
         else:
@@ -854,8 +941,10 @@ class HaloModel(Cosmology):
         satmf [str]      : subhalo mass function; either 'Tinker' or 'Jiang'
         '''
         name2 = name if name2 is None else name2
+        cuts = {}
         if name.lower() == 'cib' or name2.lower() == 'cib':
             nu_obs = self._freqtest(nu_obs)
+            cuts = self._cib_pair_cuts(nu_obs)
 
         ms = self.ms[...,None]
         mnames = self.uk_profiles.keys()
@@ -867,7 +956,7 @@ class HaloModel(Cosmology):
             square_term = self._get_pressure(name)**2
         elif (name.lower()=='cib') and (name2.lower()=='cib'):
             if subhalos:
-                square_term = self._get_cib_square(nu_obs, subhalos, cibinteg, satmf)
+                square_term = self._get_cib_square(nu_obs, subhalos, cibinteg, satmf, cuts=cuts)
             else:
                 square_term = 0.
         else:
@@ -880,7 +969,7 @@ class HaloModel(Cosmology):
                 elif nm in pnames:
                     square_term *= self._get_pressure(nm)
                 elif nm.lower()=='cib':
-                    square_term *= self._get_cib(nu_obs[0], subhalos, cibinteg, satmf)
+                    square_term *= self._get_cib(nu_obs[0], subhalos, cibinteg, satmf, cuts=cuts)
                 else: raise ValueError
 
         integrand = self.nzm[...,None] * square_term
@@ -896,8 +985,10 @@ class HaloModel(Cosmology):
         satmf [str]      : subhalo mass function; either 'Tinker' or 'Jiang'
         '''
         name2 = name if name2 is None else name2
+        cuts = {}
         if name.lower() == 'cib' or name2.lower() == 'cib':
             nu_obs = self._freqtest(nu_obs)
+            cuts = self._cib_pair_cuts(nu_obs)
 
         def _2haloint(iterm):
             integrand = self.nzm[...,None] * iterm * self.bh
@@ -919,7 +1010,7 @@ class HaloModel(Cosmology):
                 rterm01 = self._get_hod(iname,lowklim=True)
                 b = self.get_bg(self.hods[iname]['Nc'],self.hods[iname]['Ns'],self.hods[iname]['ngal'])[:,None]
             elif iname.lower()=='cib':
-                rterm1 = self._get_cib(nu_obs[inu], subhalos, cibinteg, satmf)
+                rterm1 = self._get_cib(nu_obs[inu], subhalos, cibinteg, satmf, cuts=cuts)
                 rterm01 = 0
                 b = 0
             else: raise ValueError
